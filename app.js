@@ -15,6 +15,8 @@ const verifyRefreshToken = require('./utils/verify-refresh-token');
 const generateTokens = require('./utils/generate-token');
 const multer = require('multer');
 const path = require('path');
+const compression = require("compression");
+const helmet = require("helmet");
 
 const upload_dir = process.env.UPLOADDIR;
 const file_upload_dir = process.env.FILEUPLOADDIR;
@@ -90,6 +92,9 @@ function checkImageFileType(file, cb){
 }
 
 const app = express();
+
+app.use(helmet());
+app.use(compression()); // Compress all routes
 
 app.disable('etag');
 app.use(express.static('public')); 
