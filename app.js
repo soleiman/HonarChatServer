@@ -1,4 +1,5 @@
 const express = require('express');
+require('dotenv').config();
 const mongoose = require('mongoose');
 const bodyParser = require('body-parser');
 const cors = require('cors');
@@ -8,9 +9,88 @@ const MessageModel = require('./models/message');
 const ContactModel = require('./models/contact');
 const session = require('express-session');
 const cookieParser = require('cookie-parser');
-const moment = require('moment');
+const bcrypt = require('bcryptjs');
+const { verifyToken, verify_token } = require("./utils/verify-token");
+const verifyRefreshToken = require('./utils/verify-refresh-token');
+const generateTokens = require('./utils/generate-token');
+const multer = require('multer');
+const path = require('path');
+
+const upload_dir = process.env.UPLOADDIR;
+const file_upload_dir = process.env.FILEUPLOADDIR;
+ 
+const avatarStorage = multer.diskStorage({
+    destination: function (req, file, cb) {
+      cb(null, upload_dir)
+    },
+    filename: function (req, file, cb) {
+        let extArray = file.mimetype.split("/");
+        let extension = extArray[extArray.length - 1];
+        const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+
+        cb(null, file.fieldname + '-' + uniqueSuffix + `.${extension}`);
+    }
+});
+
+const fileStorage = multer.diskStorage({
+    destination: function (req, file, cb) {
+      cb(null, file_upload_dir)
+    },
+    filename: function (req, file, cb) {
+        let extArray = file.mimetype.split("/");
+        let extension = extArray[extArray.length - 1];
+        const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+        let finalName = '';
+        if(extension !== 'pdf' || extension !== 'png' 
+        || extension !== 'jpg' || extension !== 'jpeg' 
+        || extension !== 'gif' ||  extension !== 'svg') {
+            finalName = uniqueSuffix + '-' + file.originalname;
+        }
+        else {
+            finalName = file.fieldname + '-' + uniqueSuffix + `.${extension}`;
+        }
+        
+        cb(null, finalName);
+    }
+});
+
+let upload = multer({ 
+    storage: avatarStorage,
+    limits: {
+        fileSize: 200000000
+    },
+    fileFilter: function(req, file, cb){
+        checkImageFileType(file, cb);
+    }
+});
+
+let uploadFiles = multer({ 
+    storage:fileStorage,
+    limits: {
+        fileSize: 200000000
+    },
+    fileFilter: function(req, file, cb){
+        checkImageFileType(file, cb);
+    }
+});
+
+function checkImageFileType(file, cb){
+    // Allowed ext
+    const filetypes = /jpeg|jpg|png|gif/;
+    // Check ext
+    const extname = filetypes.test(path.extname(file.originalname).toLowerCase());
+    // Check mime
+    const mimetype = filetypes.test(file.mimetype);
+  
+    if(mimetype && extname){
+      return cb(null,true);
+    } else {
+      cb('Error: Images Only!');
+    }
+}
 
 const app = express();
+
 app.disable('etag');
 app.use(express.static('public')); 
 
@@ -19,7 +99,13 @@ app.use(express.json());
 const http = require('http').Server(app);
 const port = process.env.PORT || 3001;
 
-app.use(cors());
+var corsOptions = {
+    origin: 'http://localhost:4200',
+    methods: '*'
+};
+
+app.use(cors(corsOptions));
+
 const secretString = "Nt_j5d1LlI#X2";
 
 app.use(bodyParser.urlencoded({ extended: true }));
@@ -42,6 +128,7 @@ async function connectDb() {
 }
 
 http.listen(port, () => {
+
     console.log('listening on *: ' + port);
 });
 
@@ -60,68 +147,162 @@ let checkPrvRoom = (user, roomId) => {
     else {
         return false;
     }
-};
+}
 
 // setup my socket server
 var io = require('socket.io')(http, {
+    pingTimeout: 30000,
+    pingInterval: 5000,
+    upgradeTimeout: 30000,
     cors: {
       origin: 'http://localhost:4200',
     }
 });
 
+io.use((socket, next) => {
+    const query = socket.handshake.query;
+    if (!query || !query.user_id || !socket.handshake.auth.token) {
+        console.log(`[IO MIDDLEWARE]: Invalid Session`);
+      return next(new Error("احراز هویت نامعتبر می باشد"));
+    }
+
+    // if(!verify_token(socket.handshake.auth.token)) {
+    //     return next(new Error("احراز هویت نامعتبر می باشد"));
+    // }
+
+    socket.username = query.user_id;
+    next();
+});
+
+let sokcet_users = [];
+
+let remove_socket_user = (user_id) => {
+    let s_u = sokcet_users.filter(e => e.user_id === user_id);
+    s_u.forEach(f => sokcet_users.splice(sokcet_users.findIndex(e => e.user_id === f.user_id),1));
+}
+
+let add_socket_user = (user_id, socket_id) => {
+    sokcet_users.push({
+        socket_id: socket_id,
+        user_id: user_id,
+    });
+}
+
 io.on('connection', function(socket) {
+
+    for (let [id, socket] of io.of("/").sockets) {
+        remove_socket_user(socket.username);
+        add_socket_user(socket.username, id);
+    }
+
+    console.log('[SOCKET USERS]:', sokcet_users);
+
+    socket.conn.once("upgrade", () => {
+        // called when the transport is upgraded (i.e. from HTTP long-polling to WebSocket)
+        console.log("[Upgraded Transport]:", socket.conn.transport.name); // prints "websocket"
+    });
 
     socket.on("join_room", function(roomData) {
         try {
             console.log('[socket]','join room :', roomData);
             console.log("ROOMID: ", roomData.roomId);
 
+            let alreadyJoined = [];
+
+            let room_clients = io.sockets.adapter.rooms.get(roomData.roomId);
+            if(room_clients) {
+                console.log("[room_clients]:", room_clients);
+
+                if(!roomData.is_group) { // private
+                    for(let cl of room_clients) {
+                        let s_u = sokcet_users.filter(f=>f.socket_id === cl);
+                        console.log('[SEARCH SOCKET USERS]:', s_u);
+                        if(s_u.length > 0)
+                            alreadyJoined.push(s_u[0].user_id);
+                    }
+                }
+            }
+
             socket.join(roomData.roomId);
-            socket.to(roomData.roomId).emit('user_joined', socket.id);
+
+            room_clients = io.sockets.adapter.rooms.get(roomData.roomId);
+
+            io.sockets.in(roomData.roomId).emit('user_joined', {
+                user_id: roomData.mobile_number,
+                room_id: roomData.roomId,
+                online_count: room_clients ? room_clients.size : 0,
+                already_joined_user: alreadyJoined
+            }); //socket.id
         } catch(e){
             console.log('[error]','join room :', e);
         }
     });
 
-    socket.on('leave_room', function(room) {  
+    socket.on('leave_room', function(data) {  
         try {
-            console.log('[socket]','leave room :', room);
-            socket.leave(room);
-            socket.to(room).emit('user_left', socket.id);
+            console.log('[socket]','leave room :', data);
+
+            socket.leave(data.room_id);
+
+            let room_clients = io.sockets.adapter.rooms.get(data.room_id);
+
+            socket.to(data.room_id).emit('user_left', {
+                user_id: data.mobile_number,
+                room_id: data.room_id,
+                online_count: room_clients ? room_clients.size : 0
+            });
         } catch(e){
             console.log('[error]','leave room :', e);
         }
     });
     
-    console.log('New connection');
-    const count = io.engine.clientsCount;
-    console.log("Connected clients: " + count);
+    // console.log('New connection');
+    // const count = io.engine.clientsCount;
+    // console.log("Connected clients: " + count);
     // io.emit('participants',count);
     
     // Called when the client calls socket.emit('message')
+    
     socket.on('send_message', function(data) {
 
         // socket.broadcast.emit('message', msg); // to all, but the sender
         //io.to(obj.room).emit('message',obj); // to all, including the sender
 
+        let clientId = '';
+
         let msg = {
             'body': data.body, 
-            'date': moment().format(), 
+            'date': new Date(),//moment().format(), 
             'sender': data.sender,
             'status': data.status,
             'recvId': data.recvId,
-            'recvIsGroup': data.recvIsGroup
+            'recvIsGroup': data.recvIsGroup,
+            'isAdminMsg': false
         };
 
         MessageModel.collection.insertOne(msg);
 
+        let msgWithClId = {
+            '_id': msg._id,
+            'body': msg.body, 
+            'date': msg.date, 
+            'sender': msg.sender,
+            'status': msg.status,
+            'recvId': msg.recvId,
+            'recvIsGroup': msg.recvIsGroup,
+            'isAdminMsg': false,
+            'clientId': ''
+        };
+
         if(data.recvIsGroup) {
-            socket.to(data.recvId).emit('receive_message', data, room=data.recvId);
+            socket.to(data.recvId).emit('receive_message', msgWithClId); //room=data.recvId
         }
         else {
             let prvRoom = checkPrvRoom(data.sender, data.recvId);
             if(prvRoom) {
-                socket.to(prvRoom).emit('receive_message', data, room=data.recvId);
+                msgWithClId.clientId = data.clientId;
+                io.sockets.in(prvRoom).emit('receive_message', msgWithClId);
+                //socket.to(prvRoom).emit('receive_message', msgWithClId); //, room=data.recvId
             }
         }
 
@@ -129,19 +310,203 @@ io.on('connection', function(socket) {
         
     });
 
+    socket.on('chage_msg_status', async (data)=> {
+
+        console.log('[chage_msg_status]:', data);
+
+        let msgId = data.msgId;
+        let status = data.status;
+        let roomId = data.roomId;
+
+        await MessageModel.findByIdAndUpdate(msgId, { 'status': status });
+
+        socket.to(roomId).emit('msg_status_changed', data);
+    });
+
     // Called when a client disconnects
-    socket.on('disconnect', function() {
-        console.log('Disconnection');
-        const count = io.engine.clientsCount;
-        console.log("Connected clients: " + count);
-        io.emit('participants',count);
+    socket.on('disconnect_client', function(data) {
+        console.log('Disconnection:', data);
+
+        socket.disconnect();
+
+        remove_socket_user(data.user_id);
+        
+        console.log('[AFTER DISCONNECT]:', sokcet_users);
     });
 });
 
 
 // ============ API =========================================================
+app.options('*', cors());
 
-app.post('/rooms/check-prv-room', (req, res) => {
+// Register
+app.post("/signup", cors(corsOptions), async (req, res) => {
+
+    // Our register logic starts here
+    try {
+        // Get user input
+        const { full_name, mobile_number, password, profile_image } = req.body;
+
+        // Validate user input
+        if (!(mobile_number && password && full_name)) {
+            res.status(400).send("تمامی فیلدها الزامی می باشد");
+        }
+
+        // check if user already exist
+        // Validate if user exist in our database
+        const oldUser = await UserModel.findOne({'_id': mobile_number});
+
+        if (oldUser) {
+            return res.status(409).send("شماره همراه تکراری می باشد");
+        }
+
+        //Encrypt user password
+        encryptedPassword = await bcrypt.hash(password, 10);
+
+        // Create user in our database
+
+        let newUser = {
+            _id: mobile_number,
+            mobile_number:mobile_number,
+            password: encryptedPassword,
+            full_name: full_name,
+            profile_image: profile_image
+        };
+
+        UserModel.collection.insertOne(newUser);
+
+        const { accessToken, refreshToken } = await generateTokens(user);
+
+        // save user token
+        newUser.access_token = accessToken;
+        newUser.refresh_token = refreshToken;
+
+        // return new user
+        res.status(201).json({ 
+            'token': accessToken,
+            'refresh_token': refreshToken,
+            'mobile_number': newUser.mobile_number,
+            'full_name': newUser.full_name,
+            'profile_image': newUser.profile_image
+        });
+        
+    } catch (err) {
+        console.log(err);
+    }
+    // Our register logic ends here
+});
+
+// Login
+app.post("/login", cors(corsOptions), async (req, res) => {
+        // Our login logic starts here
+    try {
+        // Get user input
+        const { mobile_number, password } = req.body;
+
+        // Validate user input
+        if (!(mobile_number && password)) {
+            res.status(400).json("شماره همراه و کلمه عبور الزامی میباشد");
+        }
+        // Validate if user exist in our database
+        const user = await UserModel.collection.findOne({ '_id': mobile_number });
+
+        if (user && (await bcrypt.compare(password, user.password))) {
+            // Create token
+            const { accessToken, refreshToken } = await generateTokens(user);
+
+            // save user token
+            user.access_token = accessToken;
+            user.refresh_token = refreshToken;
+
+            // user
+            res.status(200).json({ 
+                'token': accessToken,
+                'refresh_token': refreshToken,
+                'mobile_number': user.mobile_number,
+                'full_name': user.full_name,
+                'profile_image': user.profile_image
+            });
+        }
+        else
+            res.status(400).json("شماره همراه یا کلمه عبور اشتباه است");
+    } catch (err) {
+        console.log(err);
+    }
+});
+
+app.post("/refresh-token", cors(corsOptions), async (req, res) => {
+    console.log('[REQ REFRESH TOKEN]');
+    const { mobile_number, refresh_token } = req.body;
+
+    let user = await UserModel.collection.findOne({ '_id': mobile_number });
+    let verified = await verifyRefreshToken(refresh_token);
+    if(verified) {
+
+        const { accessToken, refreshToken } = generateTokens(user);
+    
+        return res.status(200).json({ 
+            'token': accessToken,
+            'refresh_token': refreshToken,
+            'mobile_number': user.mobile_number,
+            'full_name': user.full_name,
+            'profile_image': user.profile_image
+         });
+    }
+    else
+        return res.status(401).json({ success: false, error: "توکن نامعتبر است" });
+});
+
+app.post('/avatar/upload-avatar', verifyToken, upload.single('avatar'), async function (req, res, next) {
+    
+    const avatar_id = req.body.avatarId;
+    const is_group = (req.body.isGroup === 'true');
+
+    if (!req.file) {
+        console.log("No file is available!");
+        return res.send({
+          success: false
+        });
+      } else {
+
+        let avatarPath = 'assets/img/avatars/' + req.file.filename;
+        if(!is_group) {
+            const update = { 'profile_image': avatarPath };
+            await UserModel.findByIdAndUpdate(avatar_id, update);
+        }
+        else {
+            console.log('[is_group]:', avatar_id);
+            //const update = { 'image': avatarPath };
+            //await GroupModel.findByIdAndUpdate(avatar_id, update);
+        }
+
+        console.log('File is available!');
+        return res.send({
+          success: true,
+          file_name: req.file.filename
+        });
+      }
+});
+
+app.post('/file/upload', uploadFiles.array('files'), async function (req, res, next) {
+    
+    if (!req.files) {
+        console.log("No file is available!");
+
+        return res.send({
+          success: false
+        });
+      } else {
+
+        console.log('File is available!');
+
+        return res.send({
+          success: true
+          //file_name: req.file.filename
+        });
+      }
+});
+
+app.post('/rooms/check-prv-room', verifyToken, (req, res) => {
     let user = req.body.user;
     let roomId = req.body.roomId;
 
@@ -170,7 +535,28 @@ app.post('/rooms/check-prv-room', (req, res) => {
     }
 });
 
-app.get('/message/user-messsages-list/:id', function(req, res) {
+app.get('/message/user-messsages-list/:id', verifyToken, (req, res) => {
+    let user_id = req.params.id;
+    
+    GroupModel.find({ 'members': { '$regex': user_id, "$options" :'i' } }, (err, grps) => {
+        let userGroups = [];
+        for(let gr of grps) {
+            userGroups.push(gr._id)
+        }
+
+        MessageModel.find({ '$or': [
+            {'sender': user_id}, 
+            {'recvId': user_id},
+            {'recvId': { '$in': userGroups }}
+        ]})
+        .sort({ 'date': -1 })
+        .exec((err, msgs) => {
+            return res.status(200).json(msgs);
+        });
+    });
+});
+
+app.get('/message/user-messsages/:id', verifyToken, (req, res) => {
     let user_id = req.params.id;
     
     GroupModel.find({ 'members': { '$regex': user_id, "$options" :'i' } }, (err, grps) => {
@@ -190,45 +576,56 @@ app.get('/message/user-messsages-list/:id', function(req, res) {
     });
 });
 
-app.get('/message/user-messsages/:id', function(req, res) {
-    let user_id = req.params.id;
-    
-    GroupModel.find({ 'members': { '$regex': user_id, "$options" :'i' } }, (err, grps) => {
-        let userGroups = [];
-        for(let gr of grps) {
-            userGroups.push(gr._id)
-        }
-
-        MessageModel.find({ '$or': [
-            {'sender': user_id}, 
-            {'recvId': user_id},
-            {'recvId': { '$in': userGroups }}
-        ]},
-        (err, msgs) => {
-            return res.status(200).json(msgs);
-        });
-    });
-});
-
-app.get('/message/group-messsages/:id', (req, res)=> {
+app.get('/message/group-messsages/:id', verifyToken, (req, res)=> {
     let group_id = req.params.id;
 
-    MessageModel.find({ 'recvId': group_id }, (err, messages) => {
+    MessageModel.aggregate([
+        {
+            '$match': { 'recvId': group_id }
+        },
+        {
+            '$group' : {
+               '_id' :{ $dateToString: { format: "%Y-%m-%d", date: "$date"} },
+               'list': { $push: "$$ROOT" },
+               'count': { $sum: 1 }
+            }
+        },
+        { '$sort': { '_id': 1 }}
+    ])
+    //.sort({ 'date': 1 })
+    .exec((err, messages) => {
         return res.status(200).json(messages);
     });
 });
 
-app.get('/message/private-messsages/:id/:user', (req, res)=> {
+app.get('/message/private-messsages/:id/:user', verifyToken, (req, res)=> {
     let contact_id = req.params.id;
     let user_id = req.params.user;
-    MessageModel.find({ '$or': [{'$and': [{'recvId': user_id}, {'sender': contact_id}]}, 
-                {'$and': [{'sender': user_id}, {'recvId': contact_id}]}] }, 
-            (err, messages) => {
-                return res.status(200).json(messages);
+    MessageModel.aggregate([
+        {
+            '$match': { 
+                '$or': [
+                    {'$and': [{'recvId': user_id}, {'sender': contact_id}]}, 
+                    {'$and': [{'sender': user_id}, {'recvId': contact_id}]}
+                ]
+            }
+        },
+        {
+            '$group' : {
+               '_id' :{ $dateToString: { format: "%Y-%m-%d", date: "$date"} },
+               'list': { $push: "$$ROOT" },
+               'count': { $sum: 1 }
+            }
+        },
+        { '$sort': { '_id': 1 }}
+    ])
+    //.sort({ 'date': 1 })
+    .exec((err, messages) => {
+        return res.status(200).json(messages);
     });
 });
 
-app.get('/user/user-contacts/:id', (req, res)=> {
+app.get('/user/user-contacts/:id', verifyToken, (req, res)=> {
     let user_id = req.params.id;
 
     ContactModel.find({ 'user': user_id }, (err, contacts) => {
@@ -237,7 +634,7 @@ app.get('/user/user-contacts/:id', (req, res)=> {
     });
 });
 
-app.post('/user/create-contact', function(req, res) {
+app.post('/user/create-contact', verifyToken, (req, res) => {
 
     ContactModel.findOne({ 'user': req.body.user, 'mobile_number': req.body.mobile_number }, (err, contact) => {
         if (err) 
@@ -246,28 +643,38 @@ app.post('/user/create-contact', function(req, res) {
         if(contact)
             return res.status(500).json("مخاطب تکراری است");
 
-        if(!contact) {
-            let newContact = { 
-                user: req.body.user,
-                mobile_number: req.body.mobile_number, 
-                full_name: req.body.full_name,
-                contact_image: req.body.contact_image,
-                last_seen: moment().format(),
-                create_date: moment().format()
-            };
+        UserModel.collection.findOne({ '_id': req.body.mobile_number }, (error, user) => {
+            if (error) 
+                return res.status(500).json("خطا در ثبت مخاطب");
 
-            ContactModel.collection.insertOne(newContact);
+            if(!user)
+                return res.status(500).json("این شماره همراه حساب کاربری ندارد");
 
-            ContactModel.findOne({ 'user': req.body.user, 'mobile_number': req.body.mobile_number }, (err, new_contact) => {
-                return res.status(200).json(new_contact);
-            });
+            if(!contact) {
+                let newContact = { 
+                    user: req.body.user,
+                    mobile_number: req.body.mobile_number, 
+                    full_name: user.full_name,//req.body.full_name,
+                    contact_image: user.profile_image,//req.body.contact_image,
+                    last_seen: new Date(),//moment().format(),
+                    create_date: new Date()//moment().format()
+                };
     
-            
-        }
+                ContactModel.collection.insertOne(newContact);
+    
+                ContactModel.findOne({ 'user': req.body.user, 'mobile_number': req.body.mobile_number }, (err, new_contact) => {
+                    return res.status(200).json(new_contact);
+                });
+        
+                
+            }
+        });
+
+        
     });
 });
 
-app.get('/group/user-group/:id', (req, res)=> {
+app.get('/group/user-group/:id', verifyToken, (req, res)=> {
     let user_id = req.params.id;
 
     GroupModel.find({ 'members': { '$regex': user_id, "$options" :'i' } }, (err, groups) => {
@@ -275,24 +682,25 @@ app.get('/group/user-group/:id', (req, res)=> {
     });
 });
 
-app.post('/group/create-group', async function(req, res) {
+app.post('/group/create-group', verifyToken, async (req, res) => {
     let newGroup = { 
         name: req.body.group_name,
         members: req.body.members + ',' + req.body.user, 
         image: req.body.image,
         admins: req.body.user,
         created_by: req.body.user,
-        create_at: moment().format()
+        create_at: new Date()//moment().format()
     };
 
     await GroupModel.collection.insertOne(newGroup);
     let msg = {
         'body': 'گروه ایجاد شد', 
-        'date': moment().format(), 
-        'sender': '',
+        'date': new Date(),//moment().format(), 
+        'sender': '09000000000',
         'status': 1,
         'recvId': newGroup._id.toString(),
-        'recvIsGroup': true
+        'recvIsGroup': true,
+        'isAdminMsg': true
     };
 
     MessageModel.collection.insertOne(msg);
@@ -302,7 +710,7 @@ app.post('/group/create-group', async function(req, res) {
     return res.status(200).json(newGroup);
 });
 
-app.get('/user/user-chat-list/:id', (req, res) => {
+app.get('/user/user-chat-list/:id', verifyToken, (req, res) => {
     let user_id = req.params.id;
 
     GroupModel.find({ 'members': { '$regex': user_id, "$options" :'i' } }, (err, grps) => {
@@ -315,7 +723,7 @@ app.get('/user/user-chat-list/:id', (req, res) => {
             { 
                 '$match': { 
                     '$or': [
-                        { 'sender': user_id }, 
+                        //{ 'sender': user_id }, 
                         { 'recvId': user_id },
                         { 'recvId': { '$in': userGroups } }
                     ]
@@ -331,14 +739,15 @@ app.get('/user/user-chat-list/:id', (req, res) => {
                     'recvIsGroup': { "$first": "$recvIsGroup" }
                 }
             }
-        ], 
-        (err, msgs) => {
+        ])
+        .sort({ 'date': -1 })
+        .exec((err, msgs) => {
             return res.status(200).json(msgs);
         });
     });
 });
 
-app.get('/user/fullname/:id', (req, res) => {
+app.get('/user/fullname/:id', verifyToken, (req, res) => {
     let user_id = req.params.id;
 
     UserModel.findOne({ '_id': user_id },
@@ -347,7 +756,7 @@ app.get('/user/fullname/:id', (req, res) => {
     });
 });
 
-app.get('/user/profileimage/:id', (req, res) => {
+app.get('/user/profileimage/:id', verifyToken, (req, res) => {
     let user_id = req.params.id;
 
     UserModel.findOne({ '_id': user_id },
@@ -356,7 +765,7 @@ app.get('/user/profileimage/:id', (req, res) => {
     });
 });
 
-app.get('/group/name/:id', (req, res) => {
+app.get('/group/name/:id', verifyToken, (req, res) => {
     let group_id = req.params.id;
 
     GroupModel.findOne({ '_id': group_id },
@@ -365,11 +774,27 @@ app.get('/group/name/:id', (req, res) => {
     });
 });
 
-app.get('/group/image/:id', (req, res) => {
+app.get('/group/image/:id', verifyToken, (req, res) => {
     let group_id = req.params.id;
 
     GroupModel.findOne({ '_id': group_id },
     (err, group) => {
         return res.status(200).json(group.image);
+    });
+});
+
+app.get('/group/get-group-users/:id', verifyToken, (req, res) => {
+    let group_id = req.params.id;
+    GroupModel.findOne({ '_id': group_id },
+    (err, group) => {
+        let group_members = group.members.toString().split(',');
+
+        UserModel.find({'mobile_number': { '$in': group_members }},
+        { mobile_number: 1, full_name: 1, profile_image: 1, _id: 0 },
+        (err, users) => {
+            return res.status(200).json(users);
+        });
+
+        
     });
 });
