@@ -380,7 +380,7 @@ app.post("/signup", cors(corsOptions), async (req, res) => {
 
         UserModel.collection.insertOne(newUser);
 
-        const { accessToken, refreshToken } = await generateTokens(user);
+        const { accessToken, refreshToken } = await generateTokens(newUser);
 
         // save user token
         newUser.access_token = accessToken;
