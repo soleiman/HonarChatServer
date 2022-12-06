@@ -357,6 +357,10 @@ app.post("/signup", cors(corsOptions), async (req, res) => {
             res.status(400).send("تمامی فیلدها الزامی می باشد");
         }
 
+        if(!mobile_number.match('09(1[0-9]|3[1-9]|2[1-9])-?[0-9]{3}-?[0-9]{4}') || mobile_number.length > 11 || mobile_number.length < 1) {
+            res.status(400).send("شماره همراه اشتباه است");
+        }
+
         // check if user already exist
         // Validate if user exist in our database
         const oldUser = await UserModel.findOne({'_id': mobile_number});
