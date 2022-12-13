@@ -273,11 +273,11 @@ io.on('connection', function(socket) {
         // socket.broadcast.emit('message', msg); // to all, but the sender
         //io.to(obj.room).emit('message',obj); // to all, including the sender
 
-        let clientId = '';
+        //let clientId = '';
 
         let msg = {
             'body': data.body, 
-            'date': new Date(),//moment().format(), 
+            'date': new Date(),
             'sender': data.sender,
             'status': data.status,
             'recvId': data.recvId,
@@ -416,6 +416,11 @@ app.post("/login", cors(corsOptions), async (req, res) => {
         if (!(mobile_number && password)) {
             res.status(400).json("شماره همراه و کلمه عبور الزامی میباشد");
         }
+
+        if(!mobile_number.match('09(1[0-9]|3[1-9]|2[1-9])-?[0-9]{3}-?[0-9]{4}') || mobile_number.length > 11 || mobile_number.length < 1) {
+            res.status(400).send("شماره همراه اشتباه است");
+        }
+
         // Validate if user exist in our database
         const user = await UserModel.collection.findOne({ '_id': mobile_number });
 
@@ -629,6 +634,34 @@ app.get('/message/private-messsages/:id/:user', verifyToken, (req, res)=> {
         { '$sort': { '_id': 1 }}
     ])
     //.sort({ 'date': 1 })
+    .exec((err, messages) => {
+        return res.status(200).json(messages);
+    });
+});
+
+app.get('/message/get-latest-group-message/:id', verifyToken, (req, res) => {
+    let grpId = req.params.id;
+    GroupModel.find({
+        'recvId': grpId
+    })
+    .sort({ 'date': -1 })
+    .limit(1)
+    .exec((err, messages) => {
+        return res.status(200).json(messages);
+    });
+});
+
+app.get('/message/get-latest-private-message/:id/:user', verifyToken, (req, res) => {
+    let prvUserId = req.params.id;
+    let userId = req.params.user;
+    MessageModel.find({
+        '$or': [
+            {'$and': [{'recvId': userId}, {'sender': prvUserId}]}, 
+            {'$and': [{'sender': userId}, {'recvId': prvUserId}]}
+        ]
+    })
+    .sort({ 'date': -1 })
+    .limit(1)
     .exec((err, messages) => {
         return res.status(200).json(messages);
     });
